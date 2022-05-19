@@ -25,6 +25,9 @@
 
 typedef uint64_t u64;
 
+/* The fields of this type depends on the configuration of
+ * perf_event_attr.
+ */
 struct read_format {
 	u64 value;         /* The value of the event */
 	u64 id;            /* if PERF_FORMAT_ID */
@@ -125,8 +128,9 @@ show_samples(struct perf_event_mmap_page *meta)
 			}
 		},
 	};
-	uint64_t addrs[32];
+	uint64_t addrs[32], nr, abi, us_size;
 	const struct blazesym_result *bzresult;
+	uint32_t pid, tid;
 	int i;
 
 	rmb();
@@ -145,11 +149,11 @@ show_samples(struct perf_event_mmap_page *meta)
 
 		tail += peheader.size;
 
-		uint32_t pid = ringbuf_read_uint32(&ptr, data_start, size);
-		uint32_t tid = ringbuf_read_uint32(&ptr, data_start, size);
+		pid = ringbuf_read_uint32(&ptr, data_start, size);
+		tid = ringbuf_read_uint32(&ptr, data_start, size);
 		printf("PID %d, TID %d\n", pid, tid);
 
-		uint64_t nr = ringbuf_read_uint64(&ptr, data_start, size);
+		nr = ringbuf_read_uint64(&ptr, data_start, size);
 		for (i = 0; i < nr; i++) {
 			addrs[i] = ringbuf_read_uint64(&ptr, data_start, size);
 		}
@@ -177,7 +181,7 @@ show_samples(struct perf_event_mmap_page *meta)
 			continue;
 		}
 
-		uint64_t abi = *(uint64_t *)ptr;
+		abi = *(uint64_t *)ptr;
 		if (abi != 0) {
 			printf("ABI: %llx\n", abi);
 			ptr += sizeof(uint64_t);
@@ -208,7 +212,7 @@ show_samples(struct perf_event_mmap_page *meta)
 			continue;
 		}
 
-		uint64_t us_size = *(uint64_t *)ptr;
+		us_size = *(uint64_t *)ptr;
 		ptr += sizeof(uint64_t);
 		printf("Userspace (%lld):\n", us_size);
 		for (i = 0; i < us_size; i++) {
@@ -220,8 +224,8 @@ show_samples(struct perf_event_mmap_page *meta)
 		}
 		printf("\n");
 	}
-	wmb();
 	meta->data_tail = tail;
+	wmb();
 }
 
 
@@ -230,15 +234,14 @@ main(int argc, const char *argv[])
 {
 	struct perf_event_attr attr;
 	const int pid = -1;
-	int cpu = 0;
 	long pagesize;
 	char *mapped;
 	struct read_format pedata;
 	struct perf_event_mmap_page **metas, *meta;
 	struct pollfd *fds;
-	int nprocs;
-	int *pefds;
-	int pages, exit_code = 0, pefd, cp;
+	int nprocs;		/* number of processors/cores */
+	int *pefds;		/* perf event FDs */
+	int pages, exit_code = 0, pefd, cpu, cp;
 
 	init_symbolizer();
 
