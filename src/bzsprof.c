@@ -17,6 +17,10 @@
 #include "blazesym.h"
 
 
+#define mb()    asm volatile("mfence":::"memory")
+#define rmb()   asm volatile("lfence":::"memory")
+#define wmb()   asm volatile("sfence" ::: "memory")
+
 typedef uint64_t u64;
 
 struct read_format {
@@ -38,102 +42,174 @@ perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
 static struct blazesym *symbolizer;
 
 static void
-init_symbolizer() {
+init_symbolizer()
+{
 	symbolizer = blazesym_new();
 }
 
+static char
+ringbuf_read_byte(const char **ptr, const char *start, uint64_t size)
+{
+	const char *stop = start + size;
+	char r = **ptr;
+
+	(*ptr)++;
+
+	return r;
+}
+
 static void
-show_samples(struct perf_event_mmap_page *meta) {
+ringbuf_read(void *output, uint64_t nbytes, const char **ptr,
+	     const char *start, uint64_t size)
+{
+	const char *stop = start + size;
+	const char *_ptr = *ptr;
+	char *_output = output;
+	int i;
+
+	for (i = 0; i < nbytes; i++) {
+		_output[i] = *_ptr++;
+		if (_ptr == stop)
+			_ptr = start;
+	}
+
+	*ptr = _ptr;
+}
+
+static uint32_t
+ringbuf_read_uint32(const char **ptr, const char *start, uint64_t size)
+{
+	char *tmp[sizeof(uint32_t)];
+
+	ringbuf_read(tmp, sizeof(uint32_t), ptr, start, size);
+
+	return *(uint32_t *)tmp;
+}
+
+static uint64_t
+ringbuf_read_uint64(const char **ptr, const char *start, uint64_t size)
+{
+	char *tmp[sizeof(uint64_t)];
+
+	ringbuf_read(tmp, sizeof(uint64_t), ptr, start, size);
+
+	return *(uint64_t *)tmp;
+}
+
+static void
+show_samples(struct perf_event_mmap_page *meta)
+{
 	uint64_t head = meta->data_head;
 	uint64_t tail = meta->data_tail;
 	uint64_t offset = meta->data_offset;
 	uint64_t size = meta->data_size;
 	char *buf = (char *)meta;
-	char *ptr;
-	struct perf_event_header *peheader;
-	struct sym_file_cfg cfgs = {
-		.cfg_type = CFG_T_KERNEL,
-		.params = {
-			.kernel = { NULL, NULL },
+	char *data_start = buf + offset;
+	const char *ptr, *next_ptr;
+	struct perf_event_header peheader;
+	struct sym_file_cfg cfgs[2] = {
+		{
+			.cfg_type = CFG_T_KERNEL,
+			.params = {
+				.kernel = { NULL, NULL },
+			},
+		},
+		{
+			.cfg_type = CFG_T_PROCESS,
+			.params = {
+				.process = {
+					.pid = 0
+				}
+			}
 		},
 	};
 	uint64_t addrs[32];
 	const struct blazesym_result *bzresult;
 	int i;
 
+	rmb();
 	while (tail < head) {
-		peheader = (struct perf_event_header *)(buf + offset + (tail % size));
+		ptr = data_start + (tail % size);
+		ringbuf_read(&peheader, sizeof(peheader), &ptr, data_start, size);
+		next_ptr = data_start + ((tail + peheader.size) % size);
 
 		printf("\n");
 
-		if (peheader->type == PERF_RECORD_SAMPLE) {
-			printf("sample size = %d\n", peheader->size);
+		if (peheader.type == PERF_RECORD_SAMPLE) {
+			printf("sample size = %d\n", peheader.size);
 		} else {
 			printf("unknown\n");
 		}
 
-		tail += peheader->size;
+		tail += peheader.size;
 
-		ptr = (char *)peheader + sizeof(peheader);
-
-		uint32_t pid = *(uint32_t *)ptr;
-		ptr += sizeof(uint32_t);
-		uint32_t tid = *(uint32_t *)ptr;
-		ptr += sizeof(uint32_t);
+		uint32_t pid = ringbuf_read_uint32(&ptr, data_start, size);
+		uint32_t tid = ringbuf_read_uint32(&ptr, data_start, size);
 		printf("PID %d, TID %d\n", pid, tid);
 
-		uint64_t nr = *(uint64_t *)ptr;
-		ptr += sizeof(uint64_t);
-		printf("Kernel (%d):\n", nr);
+		uint64_t nr = ringbuf_read_uint64(&ptr, data_start, size);
 		for (i = 0; i < nr; i++) {
-			addrs[i] = *(uint64_t *)ptr;
-			ptr += sizeof(uint64_t);
+			addrs[i] = ringbuf_read_uint64(&ptr, data_start, size);
 		}
-		bzresult = blazesym_symbolize(symbolizer, &cfgs, 1, addrs, nr);
+		printf("Kernel (%d):\n", nr);
+		if (pid == 0) {
+			bzresult = blazesym_symbolize(symbolizer, cfgs, 1, addrs, nr);
+		} else {
+			cfgs[1].params.process.pid = pid;
+			bzresult = blazesym_symbolize(symbolizer, cfgs, 2, addrs, nr);
+		}
+		if (bzresult == NULL)
+			printf("Fail to symbolize addresses\n");
+
 		for (i = 0; i < nr; i++) {
-			if (bzresult[i].valid)
+			if (bzresult && bzresult[i].valid)
 				printf("  %d [<%016llx>] %s+0x%x %s:%d\n", i, addrs[i], bzresult[i].symbol, addrs[i] - bzresult[i].start_address, bzresult[i].path, bzresult[i].line_no);
 			else
 				printf("  %d [<%016llx>] UNKNOWN\n", i, addrs[i]);
 		}
-		blazesym_result_free(bzresult);
+		if (bzresult)
+			blazesym_result_free(bzresult);
 
-		if ((ptr - (char *)peheader) >= peheader->size) {
+		if (ptr == next_ptr) {
 			printf("\n");
 			continue;
 		}
 
 		uint64_t abi = *(uint64_t *)ptr;
-		printf("ABI: %llx\n", abi);
-		ptr += sizeof(uint64_t);
-		if ((ptr - (char *)peheader) >= peheader->size) {
-			printf("\n");
-			continue;
+		if (abi != 0) {
+			printf("ABI: %llx\n", abi);
+			ptr += sizeof(uint64_t);
+			if (ptr == next_ptr) {
+				printf("\n");
+				continue;
+			}
+			printf("User BP: %p\n", (void *)*(uint64_t *)ptr);
+			ptr += sizeof(uint64_t);
+			if (ptr == next_ptr) {
+				printf("\n");
+				continue;
+			}
+			printf("User SP: %p\n", (void *)*(uint64_t *)ptr);
+			ptr += sizeof(uint64_t);
+			if (ptr == next_ptr) {
+				printf("\n");
+				continue;
+			}
+			printf("User IP: %p\n", (void *)*(uint64_t *)ptr);
+			ptr += sizeof(uint64_t);
+		} else {
+			printf("No user regs\n");
 		}
-		printf("User BP: %p\n", (void *)*(uint64_t *)ptr);
-		ptr += sizeof(uint64_t);
-		if ((ptr - (char *)peheader) >= peheader->size) {
-			printf("\n");
-			continue;
-		}
-		printf("User SP: %p\n", (void *)*(uint64_t *)ptr);
-		ptr += sizeof(uint64_t);
-		if ((ptr - (char *)peheader) >= peheader->size) {
-			printf("\n");
-			continue;
-		}
-		printf("User IP: %p\n", (void *)*(uint64_t *)ptr);
-		ptr += sizeof(uint64_t);
 
-		if ((ptr - (char *)peheader) >= peheader->size) {
+		if (ptr == next_ptr) {
 			printf("\n");
 			continue;
 		}
 
-		uint64_t size = *(uint64_t *)ptr;
+		uint64_t us_size = *(uint64_t *)ptr;
 		ptr += sizeof(uint64_t);
-		printf("Userspace (%lld):\n", size);
-		for (i = 0; i < size; i++) {
+		printf("Userspace (%lld):\n", us_size);
+		for (i = 0; i < us_size; i++) {
 			if (i % 16 == 0)
 				printf("  %03x -", i);
 			printf(" %02x", *ptr++ & 0xff);
@@ -142,6 +218,7 @@ show_samples(struct perf_event_mmap_page *meta) {
 		}
 		printf("\n");
 	}
+	wmb();
 	meta->data_tail = tail;
 }
 
@@ -168,7 +245,7 @@ main(int argc, const char *argv[])
 	attr.sample_type = PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_TID;
 	attr.freq = 1;
 	attr.read_format = PERF_FORMAT_ID;
-	attr.wakeup_events = 3;
+	attr.wakeup_events = 1;
 	attr.sample_stack_user = 512;
 	attr.sample_max_stack = 30;
 	attr.sample_regs_user = (1 << PERF_REG_X86_SP) | (1 << PERF_REG_X86_IP) | (1 << PERF_REG_X86_BP);
@@ -200,7 +277,8 @@ main(int argc, const char *argv[])
 			continue;
 		}
 		printf("value %lld, id %lld\n", pedata.value, pedata.id);
-		show_samples(meta);
+		while (meta->data_head != meta->data_tail)
+			show_samples(meta);
 		fds.revents = 0;
 	}
 
