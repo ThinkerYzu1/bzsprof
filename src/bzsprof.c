@@ -7,6 +7,7 @@
 #include <linux/hw_breakpoint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 
 #include <sched.h>
 
@@ -227,15 +228,24 @@ int
 main(int argc, const char *argv[])
 {
 	struct perf_event_attr attr;
-	const int pid = -1, cpu = 0;
+	const int pid = -1;
+	int cpu = 0;
 	long pagesize;
 	char *mapped;
 	struct read_format pedata;
-	struct perf_event_mmap_page *meta;
-	struct pollfd fds;
-	int pages, exit_code = 0, pefd = -1, cp;
+	struct perf_event_mmap_page **metas, *meta;
+	struct pollfd *fds;
+	int nprocs;
+	int *pefds;
+	int pages, exit_code = 0, pefd, cp;
 
 	init_symbolizer();
+
+	nprocs = get_nprocs();
+	printf("%d processors\n", nprocs);
+	metas = (struct perf_event_mmap_page **)malloc(sizeof(struct perf_event_mmap_page *) * nprocs);
+	pefds = (int *)malloc(sizeof(int) * nprocs);
+	fds = (struct pollfd *)malloc(sizeof(struct pollfd) * nprocs);
 
 	bzero(&attr, sizeof(attr));
 	attr.type = PERF_TYPE_HARDWARE;
@@ -246,45 +256,58 @@ main(int argc, const char *argv[])
 	attr.freq = 1;
 	attr.read_format = PERF_FORMAT_ID;
 	attr.wakeup_events = 1;
-	attr.sample_stack_user = 512;
+	attr.sample_stack_user = 128;
 	attr.sample_max_stack = 30;
 	attr.sample_regs_user = (1 << PERF_REG_X86_SP) | (1 << PERF_REG_X86_IP) | (1 << PERF_REG_X86_BP);
-
-	pefd = perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-	if (pefd < 0) {
-		perror("perf_event_open");
-		return 1;
-	}
 
 	pagesize = sysconf(_SC_PAGESIZE);
 	printf("pagesize %d\n", pagesize);
 	pages = 1 + 8;
 
-	mapped = mmap(NULL, pagesize * pages, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_FILE, pefd, 0);
-	if (mapped == MAP_FAILED) {
-		perror("mmap");
-		exit_code = 1;
-		goto _exit;
-	}
-
-	meta = (struct perf_event_mmap_page *)mapped;
-	fds.fd = pefd;
-	fds.events = POLLIN;
-	while (poll(&fds, 1, -1) >= 0) {
-		cp = read(pefd, &pedata, sizeof(pedata));
-		if (cp != sizeof(pedata)) {
-			printf("invalid size %d\n", cp);
-			continue;
+	for (cpu = 0; cpu < nprocs; cpu++) {
+		pefd = perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+		if (pefd < 0) {
+			perror("perf_event_open");
+			return 1;
 		}
-		printf("value %lld, id %lld\n", pedata.value, pedata.id);
-		while (meta->data_head != meta->data_tail)
-			show_samples(meta);
-		fds.revents = 0;
+
+		mapped = mmap(NULL, pagesize * pages, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_FILE, pefd, 0);
+		if (mapped == MAP_FAILED) {
+			perror("mmap");
+			exit_code = 1;
+			goto _exit;
+		}
+
+		meta = (struct perf_event_mmap_page *)mapped;
+		pefds[cpu] = pefd;
+		metas[cpu] = meta;
+		fds[cpu].fd = pefd;
+		fds[cpu].events = POLLIN;
+	}
+	while (poll(fds, nprocs, -1) >= 0) {
+		for (cpu = 0; cpu < nprocs; cpu++) {
+			if (fds[cpu].revents == 0)
+				continue;
+			pefd = pefds[cpu];
+			meta = metas[cpu];
+			cp = read(pefd, &pedata, sizeof(pedata));
+			if (cp != sizeof(pedata)) {
+				printf("invalid size %d\n", cp);
+				continue;
+			}
+			printf("P%d: value %lld, id %lld\n", cpu, pedata.value, pedata.id);
+			while (meta->data_head != meta->data_tail)
+				show_samples(meta);
+			fds[cpu].revents = 0;
+		}
 	}
 
 _exit:
-	if (pefd >= 0) {
-		close(pefd);
+	for (cpu = 0; cpu < nprocs; cpu++) {
+		pefd = pefds[cpu];
+		if (pefd >= 0) {
+			close(pefd);
+		}
 	}
 
 	return exit_code;
