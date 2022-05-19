@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <string.h>
 #include <strings.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
@@ -244,8 +245,11 @@ main(int argc, const char *argv[])
 	nprocs = get_nprocs();
 	printf("%d processors\n", nprocs);
 	metas = (struct perf_event_mmap_page **)malloc(sizeof(struct perf_event_mmap_page *) * nprocs);
+	bzero(metas, sizeof(struct perf_event_mmap_page *) * nprocs);
 	pefds = (int *)malloc(sizeof(int) * nprocs);
+	memset(pefds, -1, sizeof(int) * nprocs);
 	fds = (struct pollfd *)malloc(sizeof(struct pollfd) * nprocs);
+	bzero(fds, sizeof(struct pollfd) * nprocs);
 
 	bzero(&attr, sizeof(attr));
 	attr.type = PERF_TYPE_HARDWARE;
@@ -305,10 +309,15 @@ main(int argc, const char *argv[])
 _exit:
 	for (cpu = 0; cpu < nprocs; cpu++) {
 		pefd = pefds[cpu];
-		if (pefd >= 0) {
+		if (pefd >= 0)
 			close(pefd);
-		}
+		meta = metas[cpu];
+		if (meta)
+			munmap(meta, pages * pagesize);
 	}
+	free(pefds);
+	free(metas);
+	free(fds);
 
 	return exit_code;
 }
