@@ -1,11 +1,11 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <string.h>
-#include <strings.h>
+#include <stdlib.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
+#include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -249,13 +249,17 @@ process_perf_events(struct perf_event_mmap_page *meta_data, struct blazesym *sym
 		free(addrs);
 }
 
+void
+show_help(const char *progname)
+{
+	printf("Usage: %s [-f <frequency>] [-p <pid>] [-h]\n", progname);
+}
 
 int
-main(int argc, const char *argv[])
+main(int argc, char * const argv[])
 {
 	struct blazesym *symbolizer;
 	struct perf_event_attr attr;
-	const int pid = -1;
 	long page_size;
 	char *mapped;
 	struct read_format pedata;
@@ -263,7 +267,26 @@ main(int argc, const char *argv[])
 	struct pollfd *fds;
 	int nprocs;		/* number of processors/cores */
 	int *pefds;		/* perf event FDs */
-	int pages, exit_code = 0, pefd, cpu, cp;
+	int pages, exit_code = 0, pefd, cpu, cp, opt;
+	int freq = 1, pid = -1;
+
+	while ((opt = getopt(argc, argv, "hf:p:")) != -1) {
+		switch (opt) {
+		case 'f':
+			freq = atoi(optarg);
+			if (freq < 1) freq = 1;
+			break;
+
+		case 'p':
+			pid = atoi(optarg);
+			if (pid < 1) pid = -1;
+			break;
+		case 'h':
+		default:
+			show_help(argv[0]);
+			return 1;
+		}
+	}
 
 	symbolizer = blazesym_new();
 	if (symbolizer == NULL)
@@ -285,7 +308,7 @@ main(int argc, const char *argv[])
 	attr.type = PERF_TYPE_HARDWARE;
 	attr.size = sizeof(attr);
 	attr.config = PERF_COUNT_HW_CPU_CYCLES;
-	attr.sample_freq = 1;
+	attr.sample_freq = freq;
 	attr.sample_type = PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_TID;
 	attr.freq = 1;
 	attr.read_format = PERF_FORMAT_ID;
