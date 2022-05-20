@@ -19,6 +19,8 @@
 #include "blazesym.h"
 
 
+#define CALLCHAIN_DEPTH_MAX 256
+
 #define mb()    asm volatile("mfence":::"memory")
 #define rmb()   asm volatile("lfence":::"memory")
 #define wmb()   asm volatile("sfence" ::: "memory")
@@ -42,14 +44,6 @@ perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
 	ret = syscall(__NR_perf_event_open, hw_event, pid, cpu,
 		      group_fd, flags);
 	return ret;
-}
-
-static struct blazesym *symbolizer;
-
-static void
-init_symbolizer()
-{
-	symbolizer = blazesym_new();
 }
 
 static char
@@ -102,15 +96,13 @@ ringbuf_read_uint64(const char **ptr, const char *start, uint64_t size)
 }
 
 static void
-show_samples(struct perf_event_mmap_page *meta)
+process_perf_events(struct perf_event_mmap_page *meta_data, struct blazesym *symbolizer)
 {
-	uint64_t head = meta->data_head;
-	uint64_t tail = meta->data_tail;
-	uint64_t offset = meta->data_offset;
-	uint64_t size = meta->data_size;
-	char *buf = (char *)meta;
-	char *data_start = buf + offset;
-	const char *ptr, *next_ptr;
+	uint64_t head = meta_data->data_head;
+	uint64_t tail = meta_data->data_tail;
+	uint64_t size = meta_data->data_size;
+	char *ring_buf = (char *)meta_data + meta_data->data_offset;
+	const char *ptr, *next_event;
 	struct perf_event_header peheader;
 	struct sym_file_cfg cfgs[2] = {
 		{
@@ -128,16 +120,23 @@ show_samples(struct perf_event_mmap_page *meta)
 			}
 		},
 	};
-	uint64_t addrs[32], nr, abi, us_size;
+	uint64_t *addrs, nr, abi, ustack_sz;
+	uint64_t _addrs[32];
+	int addrs_capa = 32;
 	const struct blazesym_result *bzresult;
 	uint32_t pid, tid;
 	int i;
 
+	addrs = _addrs;
+
+	/* Process perf events in the ring buffer */
 	rmb();
 	while (tail < head) {
-		ptr = data_start + (tail % size);
-		ringbuf_read(&peheader, sizeof(peheader), &ptr, data_start, size);
-		next_ptr = data_start + ((tail + peheader.size) % size);
+		ptr = ring_buf + (tail % size);
+		/* perf_event_header */
+		ringbuf_read(&peheader, sizeof(peheader), &ptr, ring_buf, size);
+		next_event = ring_buf + ((tail + peheader.size) % size);
+		tail += peheader.size;
 
 		printf("\n");
 
@@ -147,17 +146,31 @@ show_samples(struct perf_event_mmap_page *meta)
 			printf("unknown\n");
 		}
 
-		tail += peheader.size;
-
-		pid = ringbuf_read_uint32(&ptr, data_start, size);
-		tid = ringbuf_read_uint32(&ptr, data_start, size);
+		/* PERF_SAMPLE_ID */
+		pid = ringbuf_read_uint32(&ptr, ring_buf, size);
+		tid = ringbuf_read_uint32(&ptr, ring_buf, size);
 		printf("PID %d, TID %d\n", pid, tid);
 
-		nr = ringbuf_read_uint64(&ptr, data_start, size);
+		/* PERF_SAMPLE_CALLCHAIN - get backtrace */
+		nr = ringbuf_read_uint64(&ptr, ring_buf, size);
+		if (nr > CALLCHAIN_DEPTH_MAX) {
+			printf("\nBacktrace is too long.  Skip the event!\n");
+			continue;
+		}
+		if (nr > addrs_capa) {
+			while (nr > addrs_capa)
+				addrs_capa *= 2;
+			if (addrs == _addrs) {
+				addrs = (uint64_t *)malloc(sizeof(uint64_t) * addrs_capa);
+			} else {
+				addrs = (uint64_t *)realloc(addrs, sizeof(uint64_t) * addrs_capa);
+			}
+		}
 		for (i = 0; i < nr; i++) {
-			addrs[i] = ringbuf_read_uint64(&ptr, data_start, size);
+			addrs[i] = ringbuf_read_uint64(&ptr, ring_buf, size);
 		}
 		printf("Kernel (%d):\n", nr);
+		/* Symbolize */
 		if (pid == 0) {
 			bzresult = blazesym_symbolize(symbolizer, cfgs, 1, addrs, nr);
 		} else {
@@ -167,37 +180,41 @@ show_samples(struct perf_event_mmap_page *meta)
 		if (bzresult == NULL)
 			printf("Fail to symbolize addresses\n");
 
+		/* Show backtrace */
 		for (i = 0; i < nr; i++) {
 			if (bzresult && bzresult[i].valid)
-				printf("  %d [<%016llx>] %s+0x%x %s:%d\n", i, addrs[i], bzresult[i].symbol, addrs[i] - bzresult[i].start_address, bzresult[i].path, bzresult[i].line_no);
+				printf("  %d [<%016llx>] %s+0x%x %s:%d\n", i, addrs[i],
+				       bzresult[i].symbol, addrs[i] - bzresult[i].start_address,
+				       bzresult[i].path, bzresult[i].line_no);
 			else
 				printf("  %d [<%016llx>] UNKNOWN\n", i, addrs[i]);
 		}
 		if (bzresult)
 			blazesym_result_free(bzresult);
 
-		if (ptr == next_ptr) {
+		if (ptr == next_event) {
 			printf("\n");
 			continue;
 		}
 
+		/* PERF_SAMPLE_REGS_USER */
 		abi = *(uint64_t *)ptr;
 		if (abi != 0) {
 			printf("ABI: %llx\n", abi);
 			ptr += sizeof(uint64_t);
-			if (ptr == next_ptr) {
+			if (ptr == next_event) {
 				printf("\n");
 				continue;
 			}
 			printf("User BP: %p\n", (void *)*(uint64_t *)ptr);
 			ptr += sizeof(uint64_t);
-			if (ptr == next_ptr) {
+			if (ptr == next_event) {
 				printf("\n");
 				continue;
 			}
 			printf("User SP: %p\n", (void *)*(uint64_t *)ptr);
 			ptr += sizeof(uint64_t);
-			if (ptr == next_ptr) {
+			if (ptr == next_event) {
 				printf("\n");
 				continue;
 			}
@@ -207,15 +224,16 @@ show_samples(struct perf_event_mmap_page *meta)
 			printf("No user regs\n");
 		}
 
-		if (ptr == next_ptr) {
+		if (ptr == next_event) {
 			printf("\n");
 			continue;
 		}
 
-		us_size = *(uint64_t *)ptr;
+		/* PERF_SAMPLE_STACK_USER */
+		ustack_sz = *(uint64_t *)ptr;
 		ptr += sizeof(uint64_t);
-		printf("Userspace (%lld):\n", us_size);
-		for (i = 0; i < us_size; i++) {
+		printf("Userspace (%lld):\n", ustack_sz);
+		for (i = 0; i < ustack_sz; i++) {
 			if (i % 16 == 0)
 				printf("  %03x -", i);
 			printf(" %02x", *ptr++ & 0xff);
@@ -224,36 +242,45 @@ show_samples(struct perf_event_mmap_page *meta)
 		}
 		printf("\n");
 	}
-	meta->data_tail = tail;
+	meta_data->data_tail = tail;
 	wmb();
+
+	if (addrs != _addrs)
+		free(addrs);
 }
 
 
 int
 main(int argc, const char *argv[])
 {
+	struct blazesym *symbolizer;
 	struct perf_event_attr attr;
 	const int pid = -1;
-	long pagesize;
+	long page_size;
 	char *mapped;
 	struct read_format pedata;
-	struct perf_event_mmap_page **metas, *meta;
+	struct perf_event_mmap_page **all_meta_data, *meta_data;
 	struct pollfd *fds;
 	int nprocs;		/* number of processors/cores */
 	int *pefds;		/* perf event FDs */
 	int pages, exit_code = 0, pefd, cpu, cp;
 
-	init_symbolizer();
+	symbolizer = blazesym_new();
+	if (symbolizer == NULL)
+		return 1;
 
+	page_size = sysconf(_SC_PAGESIZE);
 	nprocs = get_nprocs();
+
 	printf("%d processors\n", nprocs);
-	metas = (struct perf_event_mmap_page **)malloc(sizeof(struct perf_event_mmap_page *) * nprocs);
-	bzero(metas, sizeof(struct perf_event_mmap_page *) * nprocs);
+	all_meta_data = (struct perf_event_mmap_page **)malloc(sizeof(struct perf_event_mmap_page *) * nprocs);
+	bzero(all_meta_data, sizeof(struct perf_event_mmap_page *) * nprocs);
 	pefds = (int *)malloc(sizeof(int) * nprocs);
 	memset(pefds, -1, sizeof(int) * nprocs);
 	fds = (struct pollfd *)malloc(sizeof(struct pollfd) * nprocs);
 	bzero(fds, sizeof(struct pollfd) * nprocs);
 
+	// Set attributes for perf_event_open()
 	bzero(&attr, sizeof(attr));
 	attr.type = PERF_TYPE_HARDWARE;
 	attr.size = sizeof(attr);
@@ -264,13 +291,14 @@ main(int argc, const char *argv[])
 	attr.read_format = PERF_FORMAT_ID;
 	attr.wakeup_events = 1;
 	attr.sample_stack_user = 128;
-	attr.sample_max_stack = 30;
+	attr.sample_max_stack = 127;
 	attr.sample_regs_user = (1 << PERF_REG_X86_SP) | (1 << PERF_REG_X86_IP) | (1 << PERF_REG_X86_BP);
 
-	pagesize = sysconf(_SC_PAGESIZE);
-	printf("pagesize %d\n", pagesize);
+	printf("page_size %d\n", page_size);
+	/* perf event fd required being mapped with a size of 1+2^n pages */
 	pages = 1 + 8;
 
+	/* Set perf events for each processor */
 	for (cpu = 0; cpu < nprocs; cpu++) {
 		pefd = perf_event_open(&attr, pid, cpu, -1, PERF_FLAG_FD_CLOEXEC);
 		if (pefd < 0) {
@@ -278,33 +306,35 @@ main(int argc, const char *argv[])
 			return 1;
 		}
 
-		mapped = mmap(NULL, pagesize * pages, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_FILE, pefd, 0);
+		mapped = mmap(NULL, page_size * pages, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_FILE, pefd, 0);
 		if (mapped == MAP_FAILED) {
 			perror("mmap");
 			exit_code = 1;
 			goto _exit;
 		}
 
-		meta = (struct perf_event_mmap_page *)mapped;
+		meta_data = (struct perf_event_mmap_page *)mapped;
 		pefds[cpu] = pefd;
-		metas[cpu] = meta;
+		all_meta_data[cpu] = meta_data;
 		fds[cpu].fd = pefd;
 		fds[cpu].events = POLLIN;
 	}
+
+	printf("\n");
 	while (poll(fds, nprocs, -1) >= 0) {
 		for (cpu = 0; cpu < nprocs; cpu++) {
 			if (fds[cpu].revents == 0)
 				continue;
 			pefd = pefds[cpu];
-			meta = metas[cpu];
+			meta_data = all_meta_data[cpu];
 			cp = read(pefd, &pedata, sizeof(pedata));
 			if (cp != sizeof(pedata)) {
 				printf("invalid size %d\n", cp);
 				continue;
 			}
-			printf("P%d: value %lld, id %lld\n", cpu, pedata.value, pedata.id);
-			while (meta->data_head != meta->data_tail)
-				show_samples(meta);
+			printf("CPU %d: value %lld, id %lld\n", cpu, pedata.value, pedata.id);
+			while (meta_data->data_head != meta_data->data_tail)
+				process_perf_events(meta_data, symbolizer);
 			fds[cpu].revents = 0;
 		}
 	}
@@ -314,13 +344,14 @@ _exit:
 		pefd = pefds[cpu];
 		if (pefd >= 0)
 			close(pefd);
-		meta = metas[cpu];
-		if (meta)
-			munmap(meta, pages * pagesize);
+		meta_data = all_meta_data[cpu];
+		if (meta_data)
+			munmap(meta_data, pages * page_size);
 	}
 	free(pefds);
-	free(metas);
+	free(all_meta_data);
 	free(fds);
+	blazesym_free(symbolizer);
 
 	return exit_code;
 }
