@@ -19,7 +19,7 @@
 #include "blazesym.h"
 
 
-#define CALLCHAIN_DEPTH_MAX 256
+#define CALLCHAIN_DEPTH_MAX 512
 
 #define mb()    asm volatile("mfence":::"memory")
 #define rmb()   asm volatile("lfence":::"memory")
@@ -154,7 +154,7 @@ process_perf_events(struct perf_event_mmap_page *meta_data, struct blazesym *sym
 		/* PERF_SAMPLE_CALLCHAIN - get backtrace */
 		nr = ringbuf_read_uint64(&ptr, ring_buf, size);
 		if (nr > CALLCHAIN_DEPTH_MAX) {
-			printf("\nBacktrace is too long.  Skip the event!\n");
+			printf("\nBacktrace is too long (>%d).  Skip the event!\n", CALLCHAIN_DEPTH_MAX);
 			continue;
 		}
 		if (nr > addrs_capa) {
@@ -252,7 +252,7 @@ process_perf_events(struct perf_event_mmap_page *meta_data, struct blazesym *sym
 void
 show_help(const char *progname)
 {
-	printf("Usage: %s [-f <frequency>] [-p <pid>] [-h]\n", progname);
+	printf("Usage: %s [-f <frequency>] [-p <pid>] [-d <stack-depth> [-h]\n", progname);
 }
 
 int
@@ -268,9 +268,9 @@ main(int argc, char * const argv[])
 	int nprocs;		/* number of processors/cores */
 	int *pefds;		/* perf event FDs */
 	int pages, exit_code = 0, pefd, cpu, cp, opt;
-	int freq = 1, pid = -1;
+	int freq = 1, pid = -1, max_stack_depth = 127;
 
-	while ((opt = getopt(argc, argv, "hf:p:")) != -1) {
+	while ((opt = getopt(argc, argv, "hf:p:d:")) != -1) {
 		switch (opt) {
 		case 'f':
 			freq = atoi(optarg);
@@ -281,6 +281,13 @@ main(int argc, char * const argv[])
 			pid = atoi(optarg);
 			if (pid < 1) pid = -1;
 			break;
+
+		case 'd':
+			max_stack_depth = atoi(optarg);
+			if (max_stack_depth < 32)
+				max_stack_depth = 32;
+			break;
+
 		case 'h':
 		default:
 			show_help(argv[0]);
@@ -314,7 +321,7 @@ main(int argc, char * const argv[])
 	attr.read_format = PERF_FORMAT_ID;
 	attr.wakeup_events = 1;
 	attr.sample_stack_user = 128;
-	attr.sample_max_stack = 127;
+	attr.sample_max_stack = max_stack_depth;
 	attr.sample_regs_user = (1 << PERF_REG_X86_SP) | (1 << PERF_REG_X86_IP) | (1 << PERF_REG_X86_BP);
 
 	printf("page_size %d\n", page_size);
