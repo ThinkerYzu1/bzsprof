@@ -169,7 +169,7 @@ process_perf_events(struct perf_event_mmap_page *meta_data, struct blazesym *sym
 		for (i = 0; i < nr; i++) {
 			addrs[i] = ringbuf_read_uint64(&ptr, ring_buf, size);
 		}
-		printf("Kernel (%d):\n", nr);
+		printf("Stack (%d):\n", nr);
 		/* Symbolize */
 		if (pid == 0) {
 			bzresult = blazesym_symbolize(symbolizer, cfgs, 1, addrs, nr);
